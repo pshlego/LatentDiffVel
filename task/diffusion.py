@@ -384,14 +384,14 @@ class SpecRollDiffusion(pl.LightningModule):
         
         for sample_idx, (roll_pred_i, roll_label_i) in enumerate(zip(roll_pred, roll_label.numpy())):
             # roll_pred (B, 1, T, F)
-            p_est, i_est = extract_notes_wo_velocity(roll_pred_i[0],
+            p_est, i_est, v_est = extract_notes_wo_velocity(roll_pred_i[0],
                                                      roll_pred_i[0],
                                                      onset_threshold=self.hparams.frame_threshold,
                                                      frame_threshold=self.hparams.frame_threshold,
                                                      rule='rule1'
                                                     )
 
-            p_ref, i_ref = extract_notes_wo_velocity(roll_label_i[0],
+            p_ref, i_ref, v_ref = extract_notes_wo_velocity(roll_label_i[0],
                                                      roll_label_i[0],
                                                      onset_threshold=self.hparams.frame_threshold,
                                                      frame_threshold=self.hparams.frame_threshold,
@@ -408,7 +408,7 @@ class SpecRollDiffusion(pl.LightningModule):
             p_est = np.array([midi_to_hz(MIN_MIDI + midi) for midi in p_est])
 
             p, r, f, o = evaluate_notes(i_ref, p_ref, i_est, p_est, offset_ratio=None)
-            
+
             if batch_idx==0:
                 torchaudio.save(f'audio_{sample_idx}.mp3',
                                 batch['audio'][sample_idx].unsqueeze(0).cpu(),
@@ -418,11 +418,11 @@ class SpecRollDiffusion(pl.LightningModule):
                 save_midi(os.path.join('./', f'clean_midi_{sample_idx}.mid'),
                           p_est[clean_notes],
                           i_est[clean_notes],
-                          [127]*len(p_est))
+                          v_est)
                 save_midi(os.path.join('./', f'raw_midi_{sample_idx}.mid'),
                           p_est,
                           i_est,
-                          [127]*len(p_est))            
+                          v_est)            
 
                 self.log("Test/Note_F1", f)         
         self.log("Test/Frame_F1", frame_f1)
@@ -1200,6 +1200,8 @@ def extract_notes_wo_velocity(onsets, frames, onset_threshold=0.5, frame_thresho
     intervals: np.ndarray of rows containing (onset_index, offset_index)
     velocities: np.ndarray of velocity values
     """
+    velocity = onsets
+
     onsets = (onsets > onset_threshold).astype(int)
     frames = (frames > frame_threshold).astype(int)
     onset_diff = np.concatenate([onsets[:1, :], onsets[1:, :] - onsets[:-1, :]], axis=0) == 1 # Make sure the activation is only 1 time-step
@@ -1214,7 +1216,8 @@ def extract_notes_wo_velocity(onsets, frames, onset_threshold=0.5, frame_thresho
 
     pitches = []
     intervals = []
-    
+    velocities = []
+
     frame_locs, pitch_locs = np.nonzero(onset_diff)
     for frame, pitch in zip(frame_locs, pitch_locs):
 
@@ -1231,8 +1234,9 @@ def extract_notes_wo_velocity(onsets, frames, onset_threshold=0.5, frame_thresho
         if offset > onset:
             pitches.append(pitch)
             intervals.append([onset, offset])
+            velocities.append(velocity[onset, pitch])
 
-    return np.array(pitches), np.array(intervals)
+    return np.array(pitches), np.array(intervals), np.array(velocities)
 
 def save_midi(path, pitches, intervals, velocities):
     """
