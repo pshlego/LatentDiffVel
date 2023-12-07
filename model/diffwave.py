@@ -17,7 +17,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from task.diffusion import SpecRollDiffusion
+from task.diffusion import SpecRollDiffusion, SpecRollLatentDiffusion, AutoencWave
 from task.baseline import SpecRollBaseline
 import torchaudio
 from model.utils import Normalization
@@ -685,6 +685,358 @@ class ClassifierFreeDiffRoll(SpecRollDiffusion):
         x = self.output_projection(x) #(B, F, T)
         return x.transpose(1,2).unsqueeze(1), spectrogram #(B, T, F)
     
+    
+    def fixed_dropout(self, x, p, masked_value=-1):
+        mask = torch.distributions.Bernoulli(probs=(p)).sample((x.shape[0],)).long()
+        mask_idx = mask.nonzero()
+        x[mask_idx] = masked_value
+        return x
+    
+    def trainable_dropout(self, x, p):
+        mask = torch.distributions.Bernoulli(probs=(p)).sample((x.shape[0],)).long()
+        mask_idx = mask.nonzero()
+        x[mask_idx] = self.trainable_parameters
+        return x
+
+class LatentDiffRoll(SpecRollLatentDiffusion):
+    def __init__(self,
+                 residual_channels,
+                 unconditional,
+                 condition,
+                 n_mels,
+                 norm_args,
+                 residual_layers = 30,
+                 kernel_size = 3,
+                 dilation_base = 1,
+                 dilation_bound = 4,
+                 spec_args = {},
+                 spec_dropout = 0.5,
+                 inpainting_t = None,
+                 inpainting_f = None,
+                 **kwargs):
+        self.spec_dropout = spec_dropout
+        super().__init__(**kwargs)
+        self.input_projection = Conv1d(44, residual_channels, 1)
+        self.diffusion_embedding = DiffusionEmbedding(len(self.betas))
+        self.spec_mapping_2_img = nn.Linear(641, 320)
+        if condition == 'trainable_spec':
+            trainable_parameters = torch.full((spec_args.n_mels,641), -1).float() # TODO: makes it automatic later
+            
+            trainable_parameters = nn.Parameter(trainable_parameters, requires_grad=True)
+            self.register_parameter("trainable_parameters", trainable_parameters)
+            self.uncon_dropout = self.trainable_dropout        
+            
+        elif condition == 'fixed' or condition == 'trainable_z':
+            self.uncon_dropout = self.fixed_dropout
+        else:
+            raise ValueError("unrecognized condition '{condition}'")
+            
+        
+        
+        # Original dilation for audio was 2**(i % dilation_cycle_length)
+        # but we might not need dilation for piano roll
+        if condition == 'trainable_z':
+            print(f"================trainable_z layers=================")
+            self.residual_layers = nn.ModuleList([
+                ResidualBlockz(n_mels, residual_channels, dilation_base**(i % dilation_bound), kernel_size, uncond=unconditional)
+                for i in range(residual_layers)
+            ])            
+        else:
+            self.residual_layers = nn.ModuleList([
+                ResidualBlock(n_mels, residual_channels, dilation_base**(i % dilation_bound), kernel_size, uncond=unconditional)
+                for i in range(residual_layers)
+            ])
+            
+        self.skip_projection = Conv1d(residual_channels, residual_channels, 1)
+        self.output_projection = Conv1d(residual_channels, 44, 1)
+        nn.init.zeros_(self.output_projection.weight)
+        
+        self.normalize_spec = Normalization(0, 1, norm_args[2])   
+        self.normalize = Normalization(norm_args[0], norm_args[1], norm_args[2])        
+
+        self.mel_layer = torchaudio.transforms.MelSpectrogram(**spec_args)        
+        # self.unet = UNet2DConditionModel.from_pretrained("hf-internal-testing/tiny-stable-diffusion-pipe", subfolder="unet")
+        # self.unet.train()
+        # self.unet.enable_gradient_checkpointing()
+        
+    # def forward(self, x_t, waveform, diffusion_step, sampling=False, inpainting_t=None, inpainting_f=None):
+    #     # roll (B, 1, T, F)
+    #     # waveform (B, L)
+    #     # x_t = x_t.squeeze(1).transpose(1,2)
+    #     if self.mel_layer != None:
+    #         spec = self.mel_layer(waveform) # (B, n_mels, T)
+    #         spec = torch.log(spec+1e-6)
+    #         spec = self.normalize_spec(spec)
+    #         if self.training: # only use dropout druing training
+    #             spec = self.uncon_dropout(spec, self.hparams.spec_dropout) # making some spec 0 to be unconditional
+                
+    #         if inpainting_t and inpainting_f==None:
+    #             spec[:,:,int(inpainting_t[0]):int(inpainting_t[1])] = -1
+    #         elif inpainting_t==None and inpainting_f:
+    #             spec[:,int(inpainting_f[0]):int(inpainting_f[1]),:] = -1
+    #         elif inpainting_t and inpainting_f:
+    #             spec[:,int(inpainting_f[0]):int(inpainting_f[1]),int(inpainting_t[0]):int(inpainting_t[1])] = -1       
+                
+    #         if sampling==True:
+    #             if self.hparams.condition == 'trainable_spec':
+    #                 spec = self.trainable_parameters
+    #             elif self.hparams.condition == 'trainable_z' or self.hparams.condition == 'fixed':
+    #                 spec = torch.full_like(spec, -1)
+
+    #         #x_t, spectrogram = trim_spec_roll(x_t, spec)
+    #         spectrogram = self.spec_mapping_2_img(spec)
+    #     else:
+    #         spectrogram = None
+            
+        
+    #     # x = self.input_projection(x_t)
+    #     # x = F.relu(x)
+    #     #############
+    #     model_pred = self.unet(x_t, diffusion_step, spectrogram).sample
+    #     # diffusion_step = self.diffusion_embedding(diffusion_step)
+            
+    #     # skip = None
+        
+    #     # index = 0
+    #     # for layer in self.residual_layers:
+    #     #     index += 1
+    #     #     x, skip_connection = layer(x, diffusion_step, spectrogram)
+            
+            
+    #     #     skip = skip_connection if skip is None else skip_connection + skip
+
+    #     # x = skip / sqrt(len(self.residual_layers))
+    #     # x = self.skip_projection(x)
+    #     # x = F.relu(x)
+    #     # x = self.output_projection(x) #(B, F, T)
+    #     ##############
+    #     return model_pred, spectrogram #(B, T, F)
+    def forward(self, x_t, waveform, diffusion_step, sampling=False, inpainting_t=None, inpainting_f=None):
+        # roll (B, 1, T, F)
+        # waveform (B, L)
+        x_t = x_t.squeeze(1).transpose(1,2)
+        
+        if self.mel_layer != None:
+            spec = self.mel_layer(waveform) # (B, n_mels, T)
+            spec = torch.log(spec+1e-6)
+            spec = self.normalize_spec(spec)
+            if self.training: # only use dropout druing training
+                spec = self.uncon_dropout(spec, self.hparams.spec_dropout) # making some spec 0 to be unconditional
+                
+            if inpainting_t and inpainting_f==None:
+                spec[:,:,int(inpainting_t[0]):int(inpainting_t[1])] = -1
+            elif inpainting_t==None and inpainting_f:
+                spec[:,int(inpainting_f[0]):int(inpainting_f[1]),:] = -1
+            elif inpainting_t and inpainting_f:
+                spec[:,int(inpainting_f[0]):int(inpainting_f[1]),int(inpainting_t[0]):int(inpainting_t[1])] = -1       
+                
+            if sampling==True:
+                if self.hparams.condition == 'trainable_spec':
+                    spec = self.trainable_parameters
+                elif self.hparams.condition == 'trainable_z' or self.hparams.condition == 'fixed':
+                    spec = torch.full_like(spec, -1)
+
+            x_t, spectrogram = trim_spec_roll(x_t, self.spec_mapping_2_img(spec))
+        else:
+            spectrogram = None
+            
+
+        x = self.input_projection(x_t)
+        x = F.relu(x)
+
+        diffusion_step = self.diffusion_embedding(diffusion_step)
+            
+        skip = None
+        
+        index = 0
+        for layer in self.residual_layers:
+            index += 1
+            x, skip_connection = layer(x, diffusion_step, spectrogram)
+            
+            
+            skip = skip_connection if skip is None else skip_connection + skip
+
+        x = skip / sqrt(len(self.residual_layers))
+        x = self.skip_projection(x)
+        x = F.relu(x)
+        x = self.output_projection(x) #(B, F, T)
+        return x.transpose(1,2).unsqueeze(1), spectrogram #(B, T, F)
+    
+    def fixed_dropout(self, x, p, masked_value=-1):
+        mask = torch.distributions.Bernoulli(probs=(p)).sample((x.shape[0],)).long()
+        mask_idx = mask.nonzero()
+        x[mask_idx] = masked_value
+        return x
+    
+    def trainable_dropout(self, x, p):
+        mask = torch.distributions.Bernoulli(probs=(p)).sample((x.shape[0],)).long()
+        mask_idx = mask.nonzero()
+        x[mask_idx] = self.trainable_parameters
+        return x        
+    
+class AutoEnc(AutoencWave):
+    def __init__(self,
+                 residual_channels,
+                 unconditional,
+                 condition,
+                 n_mels,
+                 norm_args,
+                 residual_layers = 30,
+                 kernel_size = 3,
+                 dilation_base = 1,
+                 dilation_bound = 4,
+                 spec_args = {},
+                 spec_dropout = 0.5,
+                 inpainting_t = None,
+                 inpainting_f = None,
+                 **kwargs):
+        self.spec_dropout = spec_dropout
+        super().__init__(**kwargs)
+        self.input_projection = Conv1d(44, residual_channels, 1)
+        self.diffusion_embedding = DiffusionEmbedding(len(self.betas))
+        self.spec_mapping_2_img = nn.Linear(641, 320)
+        if condition == 'trainable_spec':
+            trainable_parameters = torch.full((spec_args.n_mels,641), -1).float() # TODO: makes it automatic later
+            
+            trainable_parameters = nn.Parameter(trainable_parameters, requires_grad=True)
+            self.register_parameter("trainable_parameters", trainable_parameters)
+            self.uncon_dropout = self.trainable_dropout        
+            
+        elif condition == 'fixed' or condition == 'trainable_z':
+            self.uncon_dropout = self.fixed_dropout
+        else:
+            raise ValueError("unrecognized condition '{condition}'")
+            
+        
+        
+        # Original dilation for audio was 2**(i % dilation_cycle_length)
+        # but we might not need dilation for piano roll
+        if condition == 'trainable_z':
+            print(f"================trainable_z layers=================")
+            self.residual_layers = nn.ModuleList([
+                ResidualBlockz(n_mels, residual_channels, dilation_base**(i % dilation_bound), kernel_size, uncond=unconditional)
+                for i in range(residual_layers)
+            ])            
+        else:
+            self.residual_layers = nn.ModuleList([
+                ResidualBlock(n_mels, residual_channels, dilation_base**(i % dilation_bound), kernel_size, uncond=unconditional)
+                for i in range(residual_layers)
+            ])
+            
+        self.skip_projection = Conv1d(residual_channels, residual_channels, 1)
+        self.output_projection = Conv1d(residual_channels, 44, 1)
+        nn.init.zeros_(self.output_projection.weight)
+        
+        self.normalize_spec = Normalization(0, 1, norm_args[2])   
+        self.normalize = Normalization(norm_args[0], norm_args[1], norm_args[2])        
+
+        self.mel_layer = torchaudio.transforms.MelSpectrogram(**spec_args)        
+        # self.unet = UNet2DConditionModel.from_pretrained("hf-internal-testing/tiny-stable-diffusion-pipe", subfolder="unet")
+        # self.unet.train()
+        # self.unet.enable_gradient_checkpointing()
+        
+    # def forward(self, x_t, waveform, diffusion_step, sampling=False, inpainting_t=None, inpainting_f=None):
+    #     # roll (B, 1, T, F)
+    #     # waveform (B, L)
+    #     # x_t = x_t.squeeze(1).transpose(1,2)
+    #     if self.mel_layer != None:
+    #         spec = self.mel_layer(waveform) # (B, n_mels, T)
+    #         spec = torch.log(spec+1e-6)
+    #         spec = self.normalize_spec(spec)
+    #         if self.training: # only use dropout druing training
+    #             spec = self.uncon_dropout(spec, self.hparams.spec_dropout) # making some spec 0 to be unconditional
+                
+    #         if inpainting_t and inpainting_f==None:
+    #             spec[:,:,int(inpainting_t[0]):int(inpainting_t[1])] = -1
+    #         elif inpainting_t==None and inpainting_f:
+    #             spec[:,int(inpainting_f[0]):int(inpainting_f[1]),:] = -1
+    #         elif inpainting_t and inpainting_f:
+    #             spec[:,int(inpainting_f[0]):int(inpainting_f[1]),int(inpainting_t[0]):int(inpainting_t[1])] = -1       
+                
+    #         if sampling==True:
+    #             if self.hparams.condition == 'trainable_spec':
+    #                 spec = self.trainable_parameters
+    #             elif self.hparams.condition == 'trainable_z' or self.hparams.condition == 'fixed':
+    #                 spec = torch.full_like(spec, -1)
+
+    #         #x_t, spectrogram = trim_spec_roll(x_t, spec)
+    #         spectrogram = self.spec_mapping_2_img(spec)
+    #     else:
+    #         spectrogram = None
+            
+        
+    #     # x = self.input_projection(x_t)
+    #     # x = F.relu(x)
+    #     #############
+    #     model_pred = self.unet(x_t, diffusion_step, spectrogram).sample
+    #     # diffusion_step = self.diffusion_embedding(diffusion_step)
+            
+    #     # skip = None
+        
+    #     # index = 0
+    #     # for layer in self.residual_layers:
+    #     #     index += 1
+    #     #     x, skip_connection = layer(x, diffusion_step, spectrogram)
+            
+            
+    #     #     skip = skip_connection if skip is None else skip_connection + skip
+
+    #     # x = skip / sqrt(len(self.residual_layers))
+    #     # x = self.skip_projection(x)
+    #     # x = F.relu(x)
+    #     # x = self.output_projection(x) #(B, F, T)
+    #     ##############
+    #     return model_pred, spectrogram #(B, T, F)
+    def forward(self, x_t, waveform, diffusion_step, sampling=False, inpainting_t=None, inpainting_f=None):
+        # roll (B, 1, T, F)
+        # waveform (B, L)
+        x_t = x_t.squeeze(1).transpose(1,2)
+        
+        if self.mel_layer != None:
+            spec = self.mel_layer(waveform) # (B, n_mels, T)
+            spec = torch.log(spec+1e-6)
+            spec = self.normalize_spec(spec)
+            if self.training: # only use dropout druing training
+                spec = self.uncon_dropout(spec, self.hparams.spec_dropout) # making some spec 0 to be unconditional
+                
+            if inpainting_t and inpainting_f==None:
+                spec[:,:,int(inpainting_t[0]):int(inpainting_t[1])] = -1
+            elif inpainting_t==None and inpainting_f:
+                spec[:,int(inpainting_f[0]):int(inpainting_f[1]),:] = -1
+            elif inpainting_t and inpainting_f:
+                spec[:,int(inpainting_f[0]):int(inpainting_f[1]),int(inpainting_t[0]):int(inpainting_t[1])] = -1       
+                
+            if sampling==True:
+                if self.hparams.condition == 'trainable_spec':
+                    spec = self.trainable_parameters
+                elif self.hparams.condition == 'trainable_z' or self.hparams.condition == 'fixed':
+                    spec = torch.full_like(spec, -1)
+
+            x_t, spectrogram = trim_spec_roll(x_t, self.spec_mapping_2_img(spec))
+        else:
+            spectrogram = None
+            
+
+        x = self.input_projection(x_t)
+        x = F.relu(x)
+
+        diffusion_step = self.diffusion_embedding(diffusion_step)
+            
+        skip = None
+        
+        index = 0
+        for layer in self.residual_layers:
+            index += 1
+            x, skip_connection = layer(x, diffusion_step, spectrogram)
+            
+            
+            skip = skip_connection if skip is None else skip_connection + skip
+
+        x = skip / sqrt(len(self.residual_layers))
+        x = self.skip_projection(x)
+        x = F.relu(x)
+        x = self.output_projection(x) #(B, F, T)
+        return x.transpose(1,2).unsqueeze(1), spectrogram #(B, T, F)
     
     def fixed_dropout(self, x, p, masked_value=-1):
         mask = torch.distributions.Bernoulli(probs=(p)).sample((x.shape[0],)).long()

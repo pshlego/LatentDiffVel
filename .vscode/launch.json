@@ -1,0 +1,41 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "testdiffroll",
+            "type": "python",
+            "request": "launch",
+            "program": "./sampling.py",
+            "console": "integratedTerminal",
+            "python":"/home/shpark/anaconda3/envs/latentdiff/bin/python3.8",
+            "args":["task=transcription", "dataloader.batch_size=4", "dataset=Custom", "dataset.args.audio_ext=mp3", "dataset.args.max_segment_samples=327680", "gpus=[0]", "checkpoint_path=/home/shpark/LatentDiffVel/outputs/2023-12-06/09-18-47/LatentDiffRoll-cfdg_ddpm_x0-L15-C512-beta0.02-x_0-dilation2-l2-MAESTRO/version_1/checkpoints/last.ckpt"],
+            "env": {"name":"CUDA_VISIBLE_DEVICES", "value":"0"},
+            "justMyCode": true,
+        },
+        {
+            "name": "debugdiffroll",
+            "type": "python",
+            "request": "launch",
+            "program": "./train_spec_roll.py",
+            "console": "integratedTerminal",
+            "python":"/home/shpark/anaconda3/envs/latentdiff/bin/python3.8",
+            "args":["gpus=[0]","model.args.kernel_size=9","model.args.spec_dropout=0.1", "dataset=MAESTRO", "dataloader.train.num_workers=40", "epochs=2500", "download=False"],
+            "env": {"name":"CUDA_VISIBLE_DEVICES", "value":"0"},
+            "justMyCode": true,
+        },
+        {
+            "name": "latentdiff",
+            "type": "python",
+            "request": "launch",
+            "program": "/home/shpark/LatentDiffVel/diffusers/examples/text_to_image/train_text_to_image.py",
+            "console": "integratedTerminal",
+            "python":"/home/shpark/anaconda3/envs/latentdiff/bin/python3.8",
+            "args":["--pretrained_model_name_or_path=CompVis/stable-diffusion-v1-4", "--dataset_name=lambdalabs/pokemon-blip-captions", "--use_ema", "--resolution=512", "--center_crop", "--random_flip", "--train_batch_size=1", "--gradient_accumulation_steps=4", "--gradient_checkpointing", "--max_train_steps=15000", "--learning_rate=1e-05", "--max_grad_norm=1", "--lr_scheduler=constant","--lr_warmup_steps=0", "--output_dir=sd-pokemon-model"],
+            "env": {"name":"CUDA_VISIBLE_DEVICES", "value":"1"},
+            "justMyCode": false,
+        }
+    ]
+}

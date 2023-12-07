@@ -84,7 +84,7 @@ class Custom(Dataset):
             waveform_seg = torch.nn.functional.pad(waveform, [0,pad], value=0)
         # (segment_samples,), e.g., (160000,)            
 
-        x = torch.randn(1, 640, 88)
+        x = torch.randn(4, 320, 44)
         data_dict['waveform'] = waveform_seg
         data_dict['file_name'] = self.audio_name_list[idx].name
 

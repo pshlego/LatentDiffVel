@@ -14,8 +14,8 @@ pin_memory: True
 
 dataloader:
     train:
-        batch_size: 16
-        num_workers: 10
+        batch_size: 8
+        num_workers: 1
         shuffle: True
         pin_memory: ${pin_memory}
         prefetch_factor: 2
@@ -49,6 +49,6 @@ modelcheckpoint:
 
 defaults:
     - spec: mel
-    - model: LatentDiffRoll
+    - model: AutoEnc
     - task: classifierfree_diffusion
     - dataset: MAESTRO
